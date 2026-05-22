@@ -573,6 +573,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "crossterm",
+ "hound",
  "midir",
 ]
 
