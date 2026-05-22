@@ -1,10 +1,15 @@
+mod analysis;
+mod beat_confirmation;
+mod beat_detector;
 mod ring_buffer;
 mod time_source;
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ring_buffer::RingBuffer;
-use std::sync::Arc;
-use std::time::Duration;
 use time_source::{RealTimeSource, TimeSource};
 
 fn main() {
@@ -45,7 +50,41 @@ fn main() {
 
     stream.play().expect("failed to start stream");
 
-    let time_source = RealTimeSource;
+    let time_source: Arc<dyn TimeSource> = Arc::new(RealTimeSource);
+    let confirmed_beats = Arc::new(Mutex::new(Vec::new()));
+
+    let mel_model = PathBuf::from("models/mel_spectrogram.onnx");
+    let beat_model = PathBuf::from("models/beat_this.onnx");
+
+    let detector: Box<dyn beat_detector::BeatDetector> =
+        if mel_model.exists() && beat_model.exists() {
+            println!("Loading beat-this models...");
+            match beat_detector::BeatThisDetector::new(&mel_model, &beat_model) {
+                Ok(d) => {
+                    println!("beat-this loaded successfully");
+                    Box::new(d)
+                }
+                Err(e) => {
+                    eprintln!("Failed to load beat-this: {e}. Using stub detector at 120 BPM.");
+                    Box::new(beat_detector::StubDetector::new(120.0))
+                }
+            }
+        } else {
+            println!(
+                "Models not found at models/. Using stub detector at 120 BPM. \
+                 Run scripts/download-models.sh to get real models."
+            );
+            Box::new(beat_detector::StubDetector::new(120.0))
+        };
+
+    let rb_analysis = Arc::clone(&ring_buffer);
+    let ts_analysis = Arc::clone(&time_source);
+    let cb_analysis = Arc::clone(&confirmed_beats);
+
+    std::thread::spawn(move || {
+        analysis::run(rb_analysis, ts_analysis, sample_rate, detector, cb_analysis);
+    });
+
     println!(
         "Capturing audio into {buffer_duration_secs}s ring buffer ({} samples). Press Ctrl+C to stop.",
         ring_buffer.capacity()
@@ -59,7 +98,18 @@ fn main() {
         let recent = ring_buffer.read_latest(sample_rate as usize);
         let peak = recent.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
 
-        println!("cursor: {pos} samples ({secs:.1}s)  peak: {peak:.4}");
+        let beat_info = confirmed_beats.lock().map(|beats| {
+            let count = beats.len();
+            let latest = beats.last().map(|b| {
+                let age = b.timestamp.elapsed().as_secs_f64();
+                format!("{age:.1}s ago")
+            });
+            (count, latest)
+        });
+        let (beat_count, latest) = beat_info.unwrap_or((0, None));
+        let latest_str = latest.as_deref().unwrap_or("-");
+
+        println!("cursor: {pos} ({secs:.1}s)  peak: {peak:.4}  confirmed: {beat_count} (latest: {latest_str})");
         time_source.sleep_until(next);
     }
 }
