@@ -1,11 +1,14 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 
+use crate::beat_confirmation::ConfirmedBeat;
 use crate::input::TapEvent;
+use crate::pll::Pll;
+use crate::state::{SharedState, SystemState};
 use crate::time_source::TimeSource;
 
 const PULSES_PER_QUARTER_NOTE: u64 = 24;
@@ -14,7 +17,6 @@ const BEAT_TIMESTAMP_CAPACITY: usize = 8;
 pub struct ClockState {
     base_bpm_bits: AtomicU64,
     temporary_offset_bits: AtomicU64,
-    pub midi_gate: AtomicBool,
 }
 
 impl ClockState {
@@ -22,7 +24,6 @@ impl ClockState {
         Self {
             base_bpm_bits: AtomicU64::new(initial_bpm.to_bits()),
             temporary_offset_bits: AtomicU64::new(0.0_f64.to_bits()),
-            midi_gate: AtomicBool::new(false),
         }
     }
 
@@ -54,9 +55,11 @@ pub fn pulse_interval(bpm: f64) -> Duration {
 }
 
 pub fn run<F>(
-    state: Arc<ClockState>,
+    clock_state: Arc<ClockState>,
+    system_state: Arc<SharedState>,
     time_source: Arc<dyn TimeSource>,
     tap_rx: Receiver<TapEvent>,
+    confirmed_beats: Arc<Mutex<Vec<ConfirmedBeat>>>,
     mut on_pulse: F,
 ) where
     F: FnMut(bool) + Send,
@@ -64,15 +67,17 @@ pub fn run<F>(
     let mut pulse_count: u64 = 0;
     let mut beat_timestamps: VecDeque<Instant> = VecDeque::with_capacity(BEAT_TIMESTAMP_CAPACITY);
     let mut next_pulse = time_source.now();
+    let mut pll = Pll::new();
 
     loop {
         time_source.sleep_until(next_pulse);
 
         // Check for tap tempo events (non-blocking)
         if let Ok(tap) = tap_rx.try_recv() {
-            state.set_base_bpm(tap.bpm);
-            state.set_temporary_offset(0.0);
-            state.midi_gate.store(true, Ordering::Relaxed);
+            clock_state.set_base_bpm(tap.bpm);
+            clock_state.set_temporary_offset(0.0);
+            pll.set_tap_bpm(tap.bpm);
+            system_state.set(SystemState::RateLocking);
             // Phase reset: next beat starts NOW (ADR-0001)
             pulse_count = 0;
             next_pulse = time_source.now();
@@ -90,13 +95,26 @@ pub fn run<F>(
                 beat_timestamps.pop_front();
             }
             beat_timestamps.push_back(now);
+
+            // Run PLL on each beat
+            let beats_snapshot: Vec<Instant> = beat_timestamps.iter().copied().collect();
+            let confirmed_snapshot = confirmed_beats
+                .lock()
+                .map(|b| b.clone())
+                .unwrap_or_default();
+            pll.update(
+                &beats_snapshot,
+                &confirmed_snapshot,
+                &system_state,
+                &clock_state,
+            );
         }
 
-        let gate_open = state.midi_gate.load(Ordering::Relaxed);
+        let gate_open = system_state.midi_active();
         on_pulse(gate_open);
 
         pulse_count += 1;
-        let interval = pulse_interval(state.effective_bpm());
+        let interval = pulse_interval(clock_state.effective_bpm());
         next_pulse += interval;
     }
 }
@@ -144,18 +162,21 @@ mod tests {
 
     #[test]
     fn clock_emits_pulses_with_gate() {
-        let state = Arc::new(ClockState::new(120.0));
-        state.midi_gate.store(true, Ordering::Relaxed);
+        let clock_state = Arc::new(ClockState::new(120.0));
+        let system_state = Arc::new(SharedState::new());
+        system_state.set(SystemState::RateLocking);
 
         let ts: Arc<dyn TimeSource> = Arc::new(RealTimeSource);
         let (tx, rx) = mpsc::channel();
-        let state_clone = Arc::clone(&state);
+        let cs_clone = Arc::clone(&clock_state);
+        let ss_clone = Arc::clone(&system_state);
         let ts_clone = Arc::clone(&ts);
+        let confirmed = Arc::new(Mutex::new(Vec::new()));
 
         let (_tap_tx, tap_rx) = crossbeam_channel::unbounded();
         let handle = thread::spawn(move || {
             let mut count = 0u32;
-            run(state_clone, ts_clone, tap_rx, |gate_open| {
+            run(cs_clone, ss_clone, ts_clone, tap_rx, confirmed, |gate_open| {
                 let _ = tx.send(gate_open);
                 count += 1;
                 if count >= 48 {
@@ -179,8 +200,6 @@ mod tests {
             }
         }
 
-        // At 120 BPM, 48 pulses = 2 beats = 1 second.
-        // Allow generous timeout for CI.
         assert!(
             gated_pulses >= 24,
             "expected at least 24 gated pulses, got {gated_pulses}"

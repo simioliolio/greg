@@ -4,7 +4,9 @@ mod beat_detector;
 mod clock;
 mod input;
 mod midi;
+mod pll;
 mod ring_buffer;
+mod state;
 mod tap_tempo;
 mod time_source;
 
@@ -56,6 +58,7 @@ fn main() {
 
     let time_source: Arc<dyn TimeSource> = Arc::new(RealTimeSource);
     let confirmed_beats = Arc::new(Mutex::new(Vec::new()));
+    let system_state = Arc::new(state::SharedState::new());
 
     // Beat detector setup
     let mel_model = PathBuf::from("models/mel_spectrogram.onnx");
@@ -94,10 +97,12 @@ fn main() {
     // Tap tempo channel
     let (tap_tx, tap_rx) = crossbeam_channel::unbounded();
 
-    // Clock thread + MIDI output
+    // Clock thread + MIDI output + PLL
     let clock_state = Arc::new(clock::ClockState::new(120.0));
     let ts_clock = Arc::clone(&time_source);
-    let clock_state_clone = Arc::clone(&clock_state);
+    let cs_clock = Arc::clone(&clock_state);
+    let ss_clock = Arc::clone(&system_state);
+    let cb_clock = Arc::clone(&confirmed_beats);
 
     let mut midi_out = match midi::MidiOut::new("Greg") {
         Ok(m) => {
@@ -111,7 +116,7 @@ fn main() {
     };
 
     std::thread::spawn(move || {
-        clock::run(clock_state_clone, ts_clock, tap_rx, |gate_open| {
+        clock::run(cs_clock, ss_clock, ts_clock, tap_rx, cb_clock, |gate_open| {
             if gate_open
                 && let Some(ref mut m) = midi_out
             {
@@ -152,14 +157,10 @@ fn main() {
         let latest_str = latest.as_deref().unwrap_or("-");
 
         let bpm = clock_state.effective_bpm();
-        let gate = if clock_state.midi_gate.load(std::sync::atomic::Ordering::Relaxed) {
-            "ON"
-        } else {
-            "OFF"
-        };
+        let current_state = system_state.get();
 
         println!(
-            "cursor: {pos} ({secs:.1}s)  peak: {peak:.4}  confirmed: {beat_count} (latest: {latest_str})  clock: {bpm:.1}BPM gate={gate}"
+            "cursor: {pos} ({secs:.1}s)  peak: {peak:.4}  confirmed: {beat_count} (latest: {latest_str})  clock: {bpm:.1}BPM  state: {current_state:?}"
         );
         time_source.sleep_until(next);
     }
