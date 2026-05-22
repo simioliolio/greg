@@ -1,6 +1,8 @@
 mod analysis;
 mod beat_confirmation;
 mod beat_detector;
+mod clock;
+mod midi;
 mod ring_buffer;
 mod time_source;
 
@@ -53,6 +55,7 @@ fn main() {
     let time_source: Arc<dyn TimeSource> = Arc::new(RealTimeSource);
     let confirmed_beats = Arc::new(Mutex::new(Vec::new()));
 
+    // Beat detector setup
     let mel_model = PathBuf::from("models/mel_spectrogram.onnx");
     let beat_model = PathBuf::from("models/beat_this.onnx");
 
@@ -77,12 +80,39 @@ fn main() {
             Box::new(beat_detector::StubDetector::new(120.0))
         };
 
+    // Analysis thread
     let rb_analysis = Arc::clone(&ring_buffer);
     let ts_analysis = Arc::clone(&time_source);
     let cb_analysis = Arc::clone(&confirmed_beats);
 
     std::thread::spawn(move || {
         analysis::run(rb_analysis, ts_analysis, sample_rate, detector, cb_analysis);
+    });
+
+    // Clock thread + MIDI output
+    let clock_state = Arc::new(clock::ClockState::new(120.0));
+    let ts_clock = Arc::clone(&time_source);
+    let clock_state_clone = Arc::clone(&clock_state);
+
+    let mut midi_out = match midi::MidiOut::new("Greg") {
+        Ok(m) => {
+            println!("Virtual MIDI port 'Greg' created");
+            Some(m)
+        }
+        Err(e) => {
+            eprintln!("Failed to create MIDI port: {e}. Running without MIDI output.");
+            None
+        }
+    };
+
+    std::thread::spawn(move || {
+        clock::run(clock_state_clone, ts_clock, |gate_open| {
+            if gate_open
+                && let Some(ref mut m) = midi_out
+            {
+                m.send_clock();
+            }
+        });
     });
 
     println!(
@@ -109,7 +139,16 @@ fn main() {
         let (beat_count, latest) = beat_info.unwrap_or((0, None));
         let latest_str = latest.as_deref().unwrap_or("-");
 
-        println!("cursor: {pos} ({secs:.1}s)  peak: {peak:.4}  confirmed: {beat_count} (latest: {latest_str})");
+        let bpm = clock_state.effective_bpm();
+        let gate = if clock_state.midi_gate.load(std::sync::atomic::Ordering::Relaxed) {
+            "ON"
+        } else {
+            "OFF"
+        };
+
+        println!(
+            "cursor: {pos} ({secs:.1}s)  peak: {peak:.4}  confirmed: {beat_count} (latest: {latest_str})  clock: {bpm:.1}BPM gate={gate}"
+        );
         time_source.sleep_until(next);
     }
 }
