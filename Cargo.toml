@@ -5,5 +5,6 @@ edition = "2024"
 
 [dependencies]
 cpal = "0.15"
-aubio-rs = { version = "0.2", features = ["builtin", "bindgen"] }
-crossbeam-channel = "0.5"
+midir = "0.10"
+crossterm = "0.28"
+beat-this = "0.3"
