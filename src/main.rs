@@ -2,8 +2,10 @@ mod analysis;
 mod beat_confirmation;
 mod beat_detector;
 mod clock;
+mod input;
 mod midi;
 mod ring_buffer;
+mod tap_tempo;
 mod time_source;
 
 use std::path::PathBuf;
@@ -89,6 +91,9 @@ fn main() {
         analysis::run(rb_analysis, ts_analysis, sample_rate, detector, cb_analysis);
     });
 
+    // Tap tempo channel
+    let (tap_tx, tap_rx) = crossbeam_channel::unbounded();
+
     // Clock thread + MIDI output
     let clock_state = Arc::new(clock::ClockState::new(120.0));
     let ts_clock = Arc::clone(&time_source);
@@ -106,7 +111,7 @@ fn main() {
     };
 
     std::thread::spawn(move || {
-        clock::run(clock_state_clone, ts_clock, |gate_open| {
+        clock::run(clock_state_clone, ts_clock, tap_rx, |gate_open| {
             if gate_open
                 && let Some(ref mut m) = midi_out
             {
@@ -115,10 +120,17 @@ fn main() {
         });
     });
 
+    // Input thread (tap tempo via spacebar)
+    let ts_input = Arc::clone(&time_source);
+    std::thread::spawn(move || {
+        input::run(ts_input, tap_tx);
+    });
+
     println!(
-        "Capturing audio into {buffer_duration_secs}s ring buffer ({} samples). Press Ctrl+C to stop.",
+        "Capturing audio into {buffer_duration_secs}s ring buffer ({} samples).",
         ring_buffer.capacity()
     );
+    println!("Tap SPACE 3 times to set tempo. Press Ctrl+C to stop.");
 
     loop {
         let next = time_source.now() + Duration::from_millis(500);

@@ -3,6 +3,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::Receiver;
+
+use crate::input::TapEvent;
 use crate::time_source::TimeSource;
 
 const PULSES_PER_QUARTER_NOTE: u64 = 24;
@@ -27,7 +30,6 @@ impl ClockState {
         f64::from_bits(self.base_bpm_bits.load(Ordering::Relaxed))
     }
 
-    #[allow(dead_code)]
     pub fn set_base_bpm(&self, bpm: f64) {
         self.base_bpm_bits.store(bpm.to_bits(), Ordering::Relaxed);
     }
@@ -36,7 +38,6 @@ impl ClockState {
         f64::from_bits(self.temporary_offset_bits.load(Ordering::Relaxed))
     }
 
-    #[allow(dead_code)]
     pub fn set_temporary_offset(&self, offset: f64) {
         self.temporary_offset_bits
             .store(offset.to_bits(), Ordering::Relaxed);
@@ -55,6 +56,7 @@ pub fn pulse_interval(bpm: f64) -> Duration {
 pub fn run<F>(
     state: Arc<ClockState>,
     time_source: Arc<dyn TimeSource>,
+    tap_rx: Receiver<TapEvent>,
     mut on_pulse: F,
 ) where
     F: FnMut(bool) + Send,
@@ -65,6 +67,20 @@ pub fn run<F>(
 
     loop {
         time_source.sleep_until(next_pulse);
+
+        // Check for tap tempo events (non-blocking)
+        if let Ok(tap) = tap_rx.try_recv() {
+            state.set_base_bpm(tap.bpm);
+            state.set_temporary_offset(0.0);
+            state.midi_gate.store(true, Ordering::Relaxed);
+            // Phase reset: next beat starts NOW (ADR-0001)
+            pulse_count = 0;
+            next_pulse = time_source.now();
+            beat_timestamps.clear();
+            beat_timestamps.push_back(next_pulse);
+            eprintln!("[clock] tap tempo: {:.1} BPM, phase reset", tap.bpm);
+            continue;
+        }
 
         let is_beat = pulse_count.is_multiple_of(PULSES_PER_QUARTER_NOTE);
 
@@ -136,9 +152,10 @@ mod tests {
         let state_clone = Arc::clone(&state);
         let ts_clone = Arc::clone(&ts);
 
+        let (_tap_tx, tap_rx) = crossbeam_channel::unbounded();
         let handle = thread::spawn(move || {
             let mut count = 0u32;
-            run(state_clone, ts_clone, |gate_open| {
+            run(state_clone, ts_clone, tap_rx, |gate_open| {
                 let _ = tx.send(gate_open);
                 count += 1;
                 if count >= 48 {
