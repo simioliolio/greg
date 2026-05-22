@@ -1,23 +1,9 @@
-mod analysis;
-pub mod audio_source;
-mod beat_confirmation;
-pub mod beat_detector;
-pub mod click_track;
-mod clock;
-mod input;
-mod midi;
-mod pll;
-pub mod ring_buffer;
-mod state;
-pub mod system;
-mod tap_tempo;
-pub mod time_source;
-
 use std::sync::Arc;
 use std::time::Duration;
 
-use audio_source::{AudioSource, CpalSource};
-use time_source::{RealTimeSource, TimeSource};
+use greg::audio_source::{AudioSource, CpalSource};
+use greg::system;
+use greg::time_source::{RealTimeSource, TimeSource};
 
 fn main() {
     let source = CpalSource::new();

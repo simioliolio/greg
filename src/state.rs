@@ -26,6 +26,12 @@ pub struct SharedState {
     state: AtomicU8,
 }
 
+impl Default for SharedState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SharedState {
     pub fn new() -> Self {
         Self {

@@ -19,6 +19,12 @@ pub struct BeatConfirmation {
     runs: VecDeque<Vec<CandidateBeat>>,
 }
 
+impl Default for BeatConfirmation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BeatConfirmation {
     pub fn new() -> Self {
         Self {
